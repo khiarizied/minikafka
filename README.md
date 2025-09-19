@@ -255,16 +255,42 @@ This will start a server with:
 - Maximum segment size of 100MB
 - Maximum of 10 segments per partition
 
-### Using MiniKafkaClientWithSegments
+### Using MiniKafkaClientWithOffset
+
+The MiniKafkaClientWithOffset supports consuming messages with offset range control:
 
 ```bash
-java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafkaClientWithSegments <host> <port> [topic] [group]
+java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafkaClientWithOffset <host> <port> <topic> [group] [fromOffset] [toOffset]
 ```
 
 For example:
 
 ```bash
-java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafkaClientWithSegments localhost 9092 test-topic g1
+# Consume all messages from the beginning
+java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafkaClientWithOffset localhost 9092 test-topic g1
+
+# Consume messages from offset 1000 to offset 2000
+java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafkaClientWithOffset localhost 9092 test-topic g1 1000 2000
+
+# Consume only new messages (from the end)
+java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafkaClientWithOffset localhost 9092 test-topic g1 -2 -1
+```
+
+The fromOffset parameter supports these special values:
+- `-1` or not specified: Consume from the beginning
+- `-2`: Consume only new messages (from the end)
+- A positive number: Start consuming from this specific offset
+
+The toOffset parameter supports these values:
+- `-1` or not specified: No limit, consume indefinitely
+- A positive number: Stop after consuming messages up to this offset
+
+### Using MiniKafkaClientWithSegments
+
+The MiniKafkaClientWithSegments also supports consuming messages with offset range control and works with the segmented version of MiniKafka:
+
+```bash
+java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafkaClientWithSegments <host> <port> [topic] [group] [fromOffset] [toOffset]
 ```
 
 ### Segment File Structure
@@ -295,6 +321,8 @@ Each segment file is named with its base offset (the offset of the first message
 
 To test the producer-consumer functionality:
 
+### Basic Test
+
 1. Start the server:
    ```bash
    java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafka 9982 "./data" 4
@@ -313,4 +341,48 @@ To test the producer-consumer functionality:
 4. Or start an annotated listener:
    ```bash
    java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.AnnotatedListenerExample localhost 9982
+   ```
+
+### Bulk Message Test
+
+The MessageProducer can send multiple messages per second to test performance:
+
+1. Start the server:
+   ```bash
+   java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafka 9982 "./data" 4
+   ```
+
+2. Start a bulk producer (sends 100 messages per second):
+   ```bash
+   java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MessageProducer localhost 9982 test-topic 100
+   ```
+
+3. Start a consumer in another new terminal:
+   ```bash
+   java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafkaClient localhost 9982 test-topic g1
+   ```
+
+### Segmentation Test
+
+To test the segmentation features:
+
+1. Start the server with segmentation (small segment size for testing):
+   ```bash
+   java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafkaWithSegments 9982 "./data" 4 1 5
+   ```
+   This creates a server with segments of 1MB maximum size, keeping up to 5 segments per partition.
+
+2. Start a bulk producer to generate enough data to trigger segment rolling:
+   ```bash
+   java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MessageProducerWithSegments localhost 9982 test-topic 1000
+   ```
+
+3. Start a consumer in another new terminal:
+   ```bash
+   java -cp target/minikafka-1.0-SNAPSHOT-jar-with-dependencies.jar com.example.MiniKafkaClientWithSegments localhost 9982 test-topic g1
+   ```
+
+4. Monitor the data directory to observe segment creation:
+   ```bash
+   watch -n 1 "find ./data -name "*.log" | sort"
    ```

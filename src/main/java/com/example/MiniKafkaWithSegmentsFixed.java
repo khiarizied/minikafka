@@ -1,0 +1,618 @@
+package com.example;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.io.Reader;
+import java.io.Writer;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Scanner;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * MiniKafka with segmentation support – NOW USING DENSE RECORD-IDs
+ * (0,1,2…) instead of byte positions.
+ */
+public class MiniKafkaWithSegmentsFixed {
+
+    /* ---------------------------------------------------------- */
+    /*  unchanged fields                                           */
+    /* ---------------------------------------------------------- */
+    private final Path base;
+    private final int partitionCount;
+    private final ServerSocket server;
+    private final Map<String, SafeRandomAccessFile[]> topicFiles = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, Long>> offsets = new ConcurrentHashMap<>();
+    private final Path offsetFile;
+    private final Map<String, List<PartitionListener>> listeners = new ConcurrentHashMap<>();
+    private final Map<String, SafeRandomAccessFile> segmentFileCache = new ConcurrentHashMap<>();
+    private final long maxSegmentSizeBytes;
+    private final int maxSegmentCount;
+    private final Map<String, Map<Integer, List<Long>>> topicPartitionSegments = new ConcurrentHashMap<>();
+
+    /* NEW: per-topic, per-partition record counter (0,1,2…) */
+    private final Map<String, long[]> nextRecordId = new ConcurrentHashMap<>();
+
+    public interface PartitionListener {
+        void onMessage(int partition, long offset, String key, byte[] payload);
+    }
+
+    /* ---------------------------------------------------------- */
+    /*  constructor (unchanged)                                   */
+    /* ---------------------------------------------------------- */
+    public MiniKafkaWithSegmentsFixed(int port, Path base, int partitions,
+                                      long maxSegmentSizeBytes, int maxSegmentCount) throws IOException {
+        this.base = base;
+        this.partitionCount = partitions;
+        this.maxSegmentSizeBytes = maxSegmentSizeBytes;
+        this.maxSegmentCount = maxSegmentCount;
+        this.offsetFile = base.resolve("offsets.json");
+        Files.createDirectories(base.resolve("logs"));
+        loadOffsets();
+        loadSegments();
+        server = new ServerSocket(port);
+        Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown));
+    }
+
+    /* ---------------------------------------------------------- */
+    /*  listener API (unchanged)                                  */
+    /* ---------------------------------------------------------- */
+    public synchronized void addListener(String topic, PartitionListener l) {
+        listeners.computeIfAbsent(topic, k -> new CopyOnWriteArrayList<>()).add(l);
+    }
+
+    /* ---------------------------------------------------------- */
+    /*  server main loop (unchanged)                              */
+    /* ---------------------------------------------------------- */
+    public void serve() throws Exception {
+        System.out.println("Listening on " + server.getLocalPort() + " with " + partitionCount + " partitions");
+        System.out.println("Segmentation: max size=" + maxSegmentSizeBytes + " bytes, max count=" + maxSegmentCount);
+        while (true) {
+            Socket s = server.accept();
+            new Thread(new Session(s)).start();
+        }
+    }
+private  long nextRecordId(String topic, int partition) {
+    return nextRecordId.computeIfAbsent(topic, k -> new long[partitionCount])[partition]++;
+}
+   
+    /* ---------------------------------------------------------- */
+    /*  persistence helpers (unchanged)                           */
+    /* ---------------------------------------------------------- */
+    private SafeRandomAccessFile[] topicFiles(String topic) {
+        return topicFiles.computeIfAbsent(topic, t -> {
+            try {
+                SafeRandomAccessFile[] fa = new SafeRandomAccessFile[partitionCount];
+                for (int p = 0; p < partitionCount; p++) {
+                    List<Long> segments = getOrCreateSegments(topic, p);
+                    long baseOffset = segments.get(segments.size() - 1);
+                    Path segmentFile = getSegmentFile(topic, p, baseOffset);
+                    RandomAccessFile raf = new RandomAccessFile(segmentFile.toFile(), "rw");
+                    fa[p] = new SafeRandomAccessFile(raf);
+                }
+                return fa;
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
+    private List<Long> getOrCreateSegments(String topic, int partition) {
+        return topicPartitionSegments.computeIfAbsent(topic, k -> new ConcurrentHashMap<>())
+                .computeIfAbsent(partition, p -> {
+                    try {
+                        List<Long> segments = new ArrayList<>();
+                        Path partitionDir = base.resolve("logs").resolve(topic).resolve(String.valueOf(p));
+                        if (Files.exists(partitionDir)) {
+                            try (DirectoryStream<Path> stream = Files.newDirectoryStream(partitionDir, "*.log")) {
+                                for (Path file : stream) {
+                                    String fileName = file.getFileName().toString();
+                                    if (fileName.endsWith(".log")) {
+                                        String offsetStr = fileName.substring(0, fileName.length() - 4);
+                                        try {
+                                            long offset = Long.parseLong(offsetStr);
+                                            segments.add(offset);
+                                        } catch (NumberFormatException e) {
+                                            // skip
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Collections.sort(segments);
+                        if (segments.isEmpty()) {
+                            segments.add(0L);
+                            ensureSegmentExists(topic, partition, 0L);
+                        }
+                        return segments;
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+    }
+
+    private Path getSegmentFile(String topic, int partition, long baseOffset) {
+        return base.resolve("logs").resolve(topic).resolve(String.valueOf(partition))
+                .resolve(baseOffset + ".log");
+    }
+
+    private void ensureSegmentExists(String topic, int partition, long baseOffset) throws IOException {
+        Path segmentFile = getSegmentFile(topic, partition, baseOffset);
+        Files.createDirectories(segmentFile.getParent());
+        if (!Files.exists(segmentFile)) {
+            Files.createFile(segmentFile);
+        }
+    }
+
+    private void rollSegment(String topic, int partition, long newBaseOffset) throws IOException {
+        List<Long> segments = getOrCreateSegments(topic, partition);
+        segments.add(newBaseOffset);
+        ensureSegmentExists(topic, partition, newBaseOffset);
+        while (segments.size() > maxSegmentCount) {
+            long oldBaseOffset = segments.remove(0);
+            Path oldSegmentFile = getSegmentFile(topic, partition, oldBaseOffset);
+            String oldKey = topic + ":" + partition + ":" + oldBaseOffset;
+            SafeRandomAccessFile oldFile = segmentFileCache.remove(oldKey);
+            if (oldFile != null) {
+                try {
+                    oldFile.close();
+                } catch (IOException e) {
+                    System.err.println("Failed to close old segment file: " + e.getMessage());
+                }
+            }
+            Files.deleteIfExists(oldSegmentFile);
+            System.out.println("Deleted old segment: " + oldSegmentFile);
+        }
+        SafeRandomAccessFile[] files = topicFiles(topic);
+        if (files != null && files[partition] != null) {
+            try {
+                files[partition].getDelegate().getFD().sync();
+                System.out.println("Rolling segment for " + topic + ":" + partition + " → new base offset: " + newBaseOffset);
+            } catch (IOException e) {
+                System.err.println("Failed to sync segment before roll: " + e.getMessage());
+            }
+            try {
+                files[partition].close();
+            } catch (IOException e) {
+                System.err.println("Failed to close segment file: " + e.getMessage());
+            }
+        }
+        files[partition] = new SafeRandomAccessFile(
+                new RandomAccessFile(getSegmentFile(topic, partition, newBaseOffset).toFile(), "rw"));
+    }
+
+    private SafeRandomAccessFile getSegmentFileForRead(String topic, int partition, long baseOffset)
+            throws IOException {
+        String key = topic + ":" + partition + ":" + baseOffset;
+        Path segmentFile = getSegmentFile(topic, partition, baseOffset);
+        return segmentFileCache.computeIfAbsent(key, k -> {
+            try {
+                RandomAccessFile raf = new RandomAccessFile(segmentFile.toFile(), "r");
+                return new SafeRandomAccessFile(raf);
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to open segment file: " + segmentFile, e);
+            }
+        });
+    }
+
+    @SuppressWarnings("unchecked")
+    private void loadOffsets() {
+        if (!Files.exists(offsetFile))
+            return;
+        try (Reader r = Files.newBufferedReader(offsetFile)) {
+            Map<String, Map<String, Double>> raw = new com.google.gson.Gson().fromJson(r, Map.class);
+            raw.forEach((tp, gm) -> gm.forEach((g, off) -> offsets.computeIfAbsent(tp, k -> new ConcurrentHashMap<>())
+                    .put(g, off.longValue())));
+        } catch (Exception e) {
+            System.err.println("offset load failed: " + e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void loadSegments() {
+        Path segmentsFile = base.resolve("segments.json");
+        if (!Files.exists(segmentsFile))
+            return;
+        try (Reader r = Files.newBufferedReader(segmentsFile)) {
+            Map<String, Map<String, List<Double>>> raw = new com.google.gson.Gson().fromJson(r, Map.class);
+            raw.forEach((topic, pm) -> {
+                Map<Integer, List<Long>> partitionMap = new ConcurrentHashMap<>();
+                pm.forEach((pStr, segments) -> {
+                    int partition = Integer.parseInt(pStr);
+                    List<Long> segmentOffsets = new ArrayList<>();
+                    segments.forEach(offset -> segmentOffsets.add(offset.longValue()));
+                    partitionMap.put(partition, segmentOffsets);
+                });
+                topicPartitionSegments.put(topic, partitionMap);
+            });
+        } catch (Exception e) {
+            System.err.println("segments load failed: " + e);
+        }
+    }
+
+    private void saveOffsets() {
+        try (Writer w = Files.newBufferedWriter(offsetFile)) {
+            new com.google.gson.Gson().toJson(offsets, w);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void saveSegments() {
+        try (Writer w = Files.newBufferedWriter(base.resolve("segments.json"))) {
+            new com.google.gson.Gson().toJson(topicPartitionSegments, w);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void shutdown() {
+        try {
+            server.close();
+            topicFiles.values().forEach(fa -> {
+                for (SafeRandomAccessFile f : fa)
+                    try {
+                        f.close();
+                    } catch (Exception ignore) {
+                    }
+            });
+            segmentFileCache.values().forEach(f -> {
+                try {
+                    f.close();
+                } catch (Exception ignore) {
+                }
+            });
+            saveOffsets();
+            saveSegments();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /* ========================================================== */
+    /*  SESSION – adapted for record-ids                          */
+    /* ========================================================== */
+    private class Session implements Runnable {
+        private final Socket sock;
+        private final DataInputStream in;
+        private final DataOutputStream out;
+
+        private String consumeTopic, consumeGroup;
+        private int consumePartition;
+        private long deliverOffset;   // now = RECORD-ID
+        private byte[] deliverBuf;
+        private int lastCompressedLength; // not used anymore
+
+        /* NEW: upper bound requested by the client (-1 = none) */
+        private long consumeToOffset = -1;
+
+        Session(Socket s) throws IOException {
+            this.sock = s;
+            this.in = new DataInputStream(s.getInputStream());
+            this.out = new DataOutputStream(s.getOutputStream());
+        }
+
+        public void run() {
+            try {
+                String line;
+                while ((line = readLine()) != null) {
+                    if (line.startsWith("TOPIC")) {
+                        handleProduce(line.substring(5));
+                    } else if (line.startsWith("SET_OFFSET")) {
+                        handleSetOffset(line.substring(11));
+                    } else if (line.contains(":")) {
+                        handleConsume(line);
+                    } else if (line.equals("ACK")) {
+                        handleAck();
+                    } else {
+                        write("-ERR unknown command\n");
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("client error: " + e);
+            } finally {
+                try {
+                    sock.close();
+                } catch (IOException ignore) {
+                }
+            }
+        }
+
+        private String readLine() throws IOException {
+            StringBuilder sb = new StringBuilder();
+            int b;
+            while ((b = in.read()) != -1 && b != '\n')
+                sb.append((char) b);
+            return b == -1 ? null : sb.toString();
+        }
+
+        private void write(String s) throws IOException {
+            out.writeBytes(s);
+            out.flush();
+        }
+
+        /* ---------- PRODUCE ---------- */
+        private void handleProduce(String topicKeyPayload) throws IOException {
+            int k = topicKeyPayload.indexOf('<');
+            if (k < 0) {
+                write("-ERR bad format, expected TOPIC<key|payload>\n");
+                return;
+            }
+            String topic = topicKeyPayload.substring(0, k);
+            String keyAndPay = topicKeyPayload.substring(k + 1, topicKeyPayload.length() - 1);
+            int sep = keyAndPay.indexOf('|');
+            String key = sep < 0 ? "" : keyAndPay.substring(0, sep);
+            byte[] payloadRaw = (sep < 0 ? keyAndPay : keyAndPay.substring(sep + 1)).getBytes(StandardCharsets.UTF_8);
+
+            int partition = Math.abs(key.hashCode()) % partitionCount;
+            SafeRandomAccessFile safeFile = topicFiles(topic)[partition];
+
+            byte[] data = payloadRaw; // no compression
+
+            /* NEW: record id instead of byte offset */
+            long recordId = nextRecordId(topic, partition);
+            safeFile.seek(safeFile.length());
+            safeFile.writeInt((int) recordId);   // 4
+            safeFile.writeInt(data.length);      // 4
+            safeFile.write(data);                // N
+
+            /* roll segment by byte size (optional) */
+            if (safeFile.length() >= maxSegmentSizeBytes) {
+                rollSegment(topic, partition, recordId + 1);
+            }
+
+            write("+OFFSET " + recordId + '\n');
+
+            /* notify listeners */
+            List<PartitionListener> list = listeners.get(topic);
+            if (list != null) {
+                for (PartitionListener l : list)
+                    l.onMessage(partition, recordId, key, data);
+            }
+        }
+
+        /* ---------- CONSUME ---------- */
+        private void handleConsume(String req) throws IOException {
+            String[] parts = req.split(":");
+            if (parts.length < 2) {
+                write("-ERR bad format, expected TOPIC:GROUP[:toOffset]\n");
+                return;
+            }
+            consumeTopic = parts[0];
+
+            /* --- parse group and optional toOffset --- */
+            if (parts.length == 2) {                 // old style:  TOPIC:GROUP
+                consumeGroup = parts[1];
+                consumeToOffset = -1;
+            } else {                                 // new style:  TOPIC:GROUP:toOffset
+                consumeGroup = parts[1];
+                try {
+                    consumeToOffset = Long.parseLong(parts[parts.length - 1]);
+                } catch (NumberFormatException e) {
+                    write("-ERR invalid toOffset\n");
+                    return;
+                }
+            }
+
+            for (int p = 0; p < partitionCount; p++) {
+                String tpKey = consumeTopic + ":" + p;
+                long nextRecord = offsets.computeIfAbsent(tpKey, k -> new ConcurrentHashMap<>())
+                        .getOrDefault(consumeGroup, 0L);
+
+                List<Long> segments = getOrCreateSegments(consumeTopic, p);
+
+                boolean found = false;
+
+                for (int i = 0; i < segments.size(); i++) {
+                    long baseOffset = segments.get(i);
+                    long nextBaseOffset = (i + 1 < segments.size()) ? segments.get(i + 1) : Long.MAX_VALUE;
+
+                    if (nextRecord >= nextBaseOffset)
+                        continue;
+
+                    Path segmentFile = getSegmentFile(consumeTopic, p, baseOffset);
+                    try (RandomAccessFile f = new RandomAccessFile(segmentFile.toFile(), "r")) {
+                        long fileLength = f.length();
+                        long pos = 0; // Start from the beginning of the segment
+
+                        while (pos + 8 <= fileLength) {
+                            f.seek(pos);
+                            int recordId = f.readInt();
+                            int len      = f.readInt();
+                            if (len < 0 || len > 100_000_000) {
+                                // Data corruption or not at a record boundary.
+                                // For this implementation, we'll stop reading this segment.
+                                break;
+                            }
+                            if (pos + 8 + len > fileLength)   {
+                                // Incomplete record at the end of the file.
+                                break;
+                            }
+
+                            /* skip if not yet reached */
+                            if (recordId < nextRecord) {
+                                pos += 8 + len;
+                                continue;
+                            }
+
+                            byte[] payloadBytes = new byte[len];
+                            f.readFully(payloadBytes);
+
+                            /* respect toOffset */
+                            if (consumeToOffset >= 0 && recordId > consumeToOffset) {
+                                pos += 8 + len;
+                                continue;
+                            }
+
+                            /* deliver */
+                            deliverOffset = recordId;
+                            deliverBuf    = payloadBytes;
+                            consumePartition = p;
+
+                            write("+MSG " + recordId + ' ' + len + '\n');
+                            out.write(payloadBytes);
+                            out.write('\n');
+                            out.flush();
+
+                            found = true;
+                            break;
+                        }
+                        if (found) break;
+
+                        /* early abort if next segment is already too far */
+                        if (consumeToOffset >= 0 && pos > consumeToOffset) break;
+                    } catch (IOException e) {
+                        // skip segment
+                    }
+                }
+                if (found) return;
+            }
+
+            /* nothing found */
+            if (consumeToOffset >= 0) {
+                write("+END " + consumeToOffset + "\n");
+            } else {
+                write("+EMPTY\n");
+            }
+        }
+
+        /* ---------- ACK ---------- */
+        private void handleAck() throws IOException {
+            if (consumeTopic == null) {
+                write("-ERR no outstanding msg\n");
+                return;
+            }
+            String tpKey = consumeTopic + ":" + consumePartition;
+            offsets.get(tpKey).put(consumeGroup, deliverOffset + 1); // advance by 1 record
+            saveOffsets();
+            write("+OK\n");
+            consumeTopic = null;
+        }
+
+        /* ---------- SET_OFFSET ---------- */
+        private void handleSetOffset(String params) throws IOException {
+            String[] parts = params.split(" ", 3);
+            if (parts.length < 2) {
+                write("-ERR bad format, expected SET_OFFSET topic:group offset|BEGIN\n");
+                return;
+            }
+            String topicGroup = parts[0];
+            String offsetSpec = parts[1];
+
+            String[] topicParts = topicGroup.split(":");
+            if (topicParts.length != 2) {
+                write("-ERR bad format, expected topic:group\n");
+                return;
+            }
+            String topic = topicParts[0];
+            String group = topicParts[1];
+
+            SafeRandomAccessFile[] files = topicFiles(topic);
+            if (files == null) {
+                write("-ERR topic not found\n");
+                return;
+            }
+            for (int p = 0; p < partitionCount; p++) {
+                String tpKey = topic + ":" + p;
+                long offset;
+                if ("BEGIN".equals(offsetSpec)) {
+                    offset = 0;
+                } else {
+                    try {
+                        offset = Long.parseLong(offsetSpec);
+                    } catch (NumberFormatException e) {
+                        write("-ERR invalid offset format\n");
+                        return;
+                    }
+                }
+                offsets.computeIfAbsent(tpKey, k -> new ConcurrentHashMap<>()).put(group, offset);
+            }
+            saveOffsets();
+            write("+OK\n");
+        }
+    }
+
+    /* --------------- compression helpers (no-op) --------------- */
+    private static byte[] decompress(byte[] data) { return data; }
+    private static byte[] compress(byte[] raw)     { return raw; }
+
+    /* --------------- client helper (unchanged) --------------- */
+    public static class Client {
+        private final String host;
+        private final int port;
+        private final MiniKafkaWithSegmentsFixed serverLocal;
+        private Client(String host, int port, MiniKafkaWithSegmentsFixed serverLocal) {
+            this.host = host;
+            this.port = port;
+            this.serverLocal = serverLocal;
+        }
+        public void addListener(String topic, PartitionListener l) {
+            if (serverLocal != null) {
+                serverLocal.addListener(topic, l);
+                return;
+            }
+            throw new UnsupportedOperationException("remote listener not implemented over TCP yet");
+        }
+        public long produce(String topic, String key, byte[] payload) throws IOException {
+            try (Socket s = new Socket(host, port);
+                 DataOutputStream out = new DataOutputStream(s.getOutputStream());
+                 DataInputStream in = new DataInputStream(s.getInputStream())) {
+                out.writeBytes("TOPIC" + topic + '<' + (key == null ? "" : key) + '|'
+                        + new String(payload, StandardCharsets.UTF_8) + ">\n");
+                out.flush();
+                String resp = new Scanner(in).nextLine();
+                return Long.parseLong(resp.split(" ")[1]);
+            }
+        }
+    }
+    public static Client connect(String host, int port) {
+        return new Client(host, port, null);
+    }
+    public static Client connectLocal(MiniKafkaWithSegmentsFixed server) {
+        return new Client(null, 0, server);
+    }
+
+    /* --------------- main --------------- */
+    public static void main(String[] args) throws Exception {
+        if (args.length < 2) {
+            System.err.println(
+                    "usage: java MiniKafkaWithSegmentsFixed <port> <data-dir> [partitionCount] [maxSegmentSizeMB] [maxSegmentCount]");
+            System.exit(1);
+        }
+        int port = Integer.parseInt(args[0]);
+        Path dir = Paths.get(args[1]);
+        int parts = args.length > 2 ? Integer.parseInt(args[2]) : 4;
+        long maxSegmentSizeMB = args.length > 3 ? Long.parseLong(args[3]) : 100;
+        int maxSegmentCount = args.length > 4 ? Integer.parseInt(args[4]) : 10;
+
+        new MiniKafkaWithSegmentsFixed(port, dir, parts, maxSegmentSizeMB * 1024 * 1024, maxSegmentCount).serve();
+    }
+ /* --------------- thread-safe RAF wrapper (unchanged) --------------- */
+    private static class SafeRandomAccessFile {
+        private final RandomAccessFile delegate;
+        private final ReentrantLock lock = new ReentrantLock();
+        SafeRandomAccessFile(RandomAccessFile file) { this.delegate = file; }
+        void writeInt(int v)  throws IOException { lock.lock(); try { delegate.writeInt(v); } finally { lock.unlock(); } }
+        void write(byte[] b)  throws IOException { lock.lock(); try { delegate.write(b); }   finally { lock.unlock(); } }
+        long length()         throws IOException { lock.lock(); try { return delegate.length(); } finally { lock.unlock(); } }
+        void seek(long p)     throws IOException { lock.lock(); try { delegate.seek(p); } finally { lock.unlock(); } }
+        int  readInt()        throws IOException { lock.lock(); try { return delegate.readInt(); } finally { lock.unlock(); } }
+        void readFully(byte[] b) throws IOException { lock.lock(); try { delegate.readFully(b); } finally { lock.unlock(); } }
+        void close()          throws IOException { lock.lock(); try { delegate.close(); } finally { lock.unlock(); } }
+        RandomAccessFile getDelegate() { return delegate; }
+        boolean isOpen() { return delegate.getChannel().isOpen(); }
+    }
+}
