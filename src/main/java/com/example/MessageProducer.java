@@ -34,19 +34,11 @@ public class MessageProducer {
                     int messageId = random.nextInt(1000000);
                     String key = "key-" + messageId;
 
-                    // Generate a mixed binary/text payload
-                    String textPart = "{\"id\":" + messageId + ",\"ts\":" + System.currentTimeMillis() + "}";
-                    byte[] textBytes = textPart.getBytes(StandardCharsets.UTF_8);
-                    byte[] binaryPart = new byte[16]; // 16 random bytes
-                    random.nextBytes(binaryPart);
-
-                    // Combine into a single payload
-                    byte[] payload = new byte[textBytes.length + binaryPart.length];
-                    System.arraycopy(textBytes, 0, payload, 0, textBytes.length);
-                    System.arraycopy(binaryPart, 0, payload, textBytes.length, binaryPart.length);
-
+                    // Generate a JSON text payload
+                    String payload = "{\"id\":" + messageId + ",\"ts\":" + System.currentTimeMillis() + "}";
+                    
                     // Send the message
-                    client.produce(topic, key, payload);
+                    client.produce(topic, key, payload.getBytes(StandardCharsets.UTF_8));
                     totalMessagesSent.incrementAndGet();
                     sentInBatch++;
                 }

@@ -21,9 +21,11 @@ import java.util.Scanner;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.zip.CRC32;
+import java.util.zip.Checksum;
 
 /**
- * MiniKafka with segmentation support – NOW USING DENSE RECORD-IDs
+ * MiniKafka with segmentation support – NOW USING DENSE RECORD-Ids
  * (0,1,2…) instead of byte positions.
  */
 public class MiniKafkaWithSegmentsFixed {
@@ -368,8 +370,20 @@ private  long nextRecordId(String topic, int partition) {
             SafeRandomAccessFile safeFile = topicFiles(topic)[partition];
 
             long recordId = nextRecordId(topic, partition);
+            long timestamp = System.currentTimeMillis();
+            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+
+            // Calculate CRC32 of the payload
+            Checksum crc = new CRC32();
+            crc.update(payload, 0, payload.length);
+            int crcValue = (int) crc.getValue();
+
             safeFile.seek(safeFile.length());
-            safeFile.writeInt((int) recordId);
+            safeFile.writeLong(recordId);
+            safeFile.writeLong(timestamp);
+            safeFile.writeInt(crcValue); // CRC32
+            safeFile.writeInt(keyBytes.length);
+            safeFile.write(keyBytes);
             safeFile.writeInt(payload.length);
             safeFile.write(payload);
 
@@ -439,32 +453,53 @@ private  long nextRecordId(String topic, int partition) {
                         long fileLength = f.length();
                         long pos = 0; // Start from the beginning of the segment
 
-                        while (pos + 8 <= fileLength) {
+                        while (pos + 8 <= fileLength) { // Check for at least a long
                             f.seek(pos);
-                            int recordId = f.readInt();
+                            long recordId = f.readLong();
+                            long timestamp = f.readLong();
+                            int crcValue = f.readInt(); // Read CRC32
+                            
+                            int keyLen = f.readInt();
+                            if (keyLen < 0 || keyLen > 1024) { // Sanity check for key length
+                                break;
+                            }
+                            byte[] keyBytes = new byte[keyLen];
+                            f.readFully(keyBytes);
+                            String key = new String(keyBytes, StandardCharsets.UTF_8);
+
                             int len = f.readInt();
                             if (len < 0 || len > 100_000_000) {
                                 // Data corruption or not at a record boundary.
-                                // For this implementation, we'll stop reading this segment.
                                 break;
                             }
-                            if (pos + 8 + len > fileLength) {
+                            
+                            long recordEndPos = pos + 8 + 8 + 4 + 4 + keyLen + 4 + len; // Adjusted for CRC
+                            if (recordEndPos > fileLength) {
                                 // Incomplete record at the end of the file.
                                 break;
                             }
 
                             /* skip if not yet reached */
                             if (recordId < nextRecord) {
-                                pos += 8 + len;
+                                pos = recordEndPos;
                                 continue;
                             }
 
                             byte[] payloadBytes = new byte[len];
                             f.readFully(payloadBytes);
 
+                            // Verify CRC32
+                            Checksum crc = new CRC32();
+                            crc.update(payloadBytes, 0, payloadBytes.length);
+                            if ((int) crc.getValue() != crcValue) {
+                                System.err.println("CRC mismatch for record " + recordId + " in " + segmentFile + ". Skipping.");
+                                pos = recordEndPos;
+                                continue; // Skip corrupted record
+                            }
+
                             /* respect toOffset */
                             if (consumeToOffset >= 0 && recordId > consumeToOffset) {
-                                pos += 8 + len;
+                                pos = recordEndPos;
                                 continue;
                             }
 
@@ -473,7 +508,7 @@ private  long nextRecordId(String topic, int partition) {
                             deliverBuf = payloadBytes;
                             consumePartition = p;
 
-                            write("+MSG " + recordId + ' ' + len + ' ' + p + '\n');
+                            write("+MSG " + recordId + ' ' + len + ' ' + p + ' ' + key + '\n');
                             out.write(payloadBytes);
                             out.write('\n');
                             out.flush();
@@ -619,10 +654,12 @@ private  long nextRecordId(String topic, int partition) {
         private final RandomAccessFile delegate;
         private final ReentrantLock lock = new ReentrantLock();
         SafeRandomAccessFile(RandomAccessFile file) { this.delegate = file; }
+        void writeLong(long v) throws IOException { lock.lock(); try { delegate.writeLong(v); } finally { lock.unlock(); } }
         void writeInt(int v)  throws IOException { lock.lock(); try { delegate.writeInt(v); } finally { lock.unlock(); } }
         void write(byte[] b)  throws IOException { lock.lock(); try { delegate.write(b); }   finally { lock.unlock(); } }
         long length()         throws IOException { lock.lock(); try { return delegate.length(); } finally { lock.unlock(); } }
         void seek(long p)     throws IOException { lock.lock(); try { delegate.seek(p); } finally { lock.unlock(); } }
+        long readLong()       throws IOException { lock.lock(); try { return delegate.readLong(); } finally { lock.unlock(); } }
         int  readInt()        throws IOException { lock.lock(); try { return delegate.readInt(); } finally { lock.unlock(); } }
         void readFully(byte[] b) throws IOException { lock.lock(); try { delegate.readFully(b); } finally { lock.unlock(); } }
         void close()          throws IOException { lock.lock(); try { delegate.close(); } finally { lock.unlock(); } }

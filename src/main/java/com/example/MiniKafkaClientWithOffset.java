@@ -108,10 +108,11 @@ public class MiniKafkaClientWithOffset implements AutoCloseable {
                         throw new IOException("Unexpected response: " + resp);
                     }
 
-                    String[] meta = resp.split(" ");
+                    String[] meta = resp.split(" ", 5);
                     long offset = Long.parseLong(meta[1]);
                     int len = Integer.parseInt(meta[2]);
                     int receivedPartition = Integer.parseInt(meta[3]);
+                    String key = (meta.length > 4) ? meta[4] : "";
 
                     if (toOffset >= 0 && offset > toOffset) {
                         System.out.println("Reached end offset " + toOffset + ", stopping consumption");
@@ -122,7 +123,7 @@ public class MiniKafkaClientWithOffset implements AutoCloseable {
                     in.readFully(payload);
                     in.read(); // consume trailing \n
 
-                    handler.onMessage(receivedPartition, offset, "", payload);
+                    handler.onMessage(receivedPartition, offset, key, payload);
 
                     out.writeBytes("ACK\n");
                     out.flush();
@@ -247,7 +248,7 @@ public class MiniKafkaClientWithOffset implements AutoCloseable {
                     safeDisplay = "<binary (" + payload.length + " bytes)> " + bytesToHex(payload);
                 }
                 System.out
-                        .println("Received message at offset " + offset + " (partition " + p + "): " + safeDisplay);
+                        .println("Received message at offset " + offset + " (partition " + p + ", key=" + key + "): " + safeDisplay);
             });
 
             // Keep alive
