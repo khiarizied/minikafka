@@ -4,8 +4,6 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.io.Reader;
-import java.io.Writer;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -37,8 +35,8 @@ public class MiniKafkaWithSegmentsFixed {
     private final int partitionCount;
     private final ServerSocket server;
     private final Map<String, SafeRandomAccessFile[]> topicFiles = new ConcurrentHashMap<>();
-    private final Map<String, Map<String, Long>> offsets = new ConcurrentHashMap<>();
-    private final Path offsetFile;
+    // private final Map<String, Map<String, Long>> offsets = new ConcurrentHashMap<>(); // Replaced by GroupCoordinator
+    // private final Path offsetFile; // Replaced by GroupCoordinator
     private final Map<String, List<PartitionListener>> listeners = new ConcurrentHashMap<>();
     private final Map<String, SafeRandomAccessFile> segmentFileCache = new ConcurrentHashMap<>();
     private final long maxSegmentSizeBytes;
@@ -47,6 +45,9 @@ public class MiniKafkaWithSegmentsFixed {
 
     /* NEW: per-topic, per-partition record counter (0,1,2…) */
     private final Map<String, long[]> nextRecordId = new ConcurrentHashMap<>();
+
+    // NEW: Centralized group management
+    private final GroupCoordinator groupCoordinator;
 
     public interface PartitionListener {
         void onMessage(int partition, long offset, String key, byte[] payload);
@@ -61,12 +62,63 @@ public class MiniKafkaWithSegmentsFixed {
         this.partitionCount = partitions;
         this.maxSegmentSizeBytes = maxSegmentSizeBytes;
         this.maxSegmentCount = maxSegmentCount;
-        this.offsetFile = base.resolve("offsets.json");
+        // this.offsetFile = base.resolve("offsets.json"); // Replaced
         Files.createDirectories(base.resolve("logs"));
-        loadOffsets();
-        loadSegments();
+        
+        // Initialize the Group Coordinator
+        this.groupCoordinator = new GroupCoordinator(this);
+
+        rebuildSegmentsFromDisk(); // More robust than loading from a potentially stale JSON file
         server = new ServerSocket(port);
+
+        // Must be called AFTER server socket is created
+        this.groupCoordinator.loadOffsetsFromTopic();
+
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown));
+    }
+
+    public int getPort() {
+        return server.getLocalPort();
+    }
+
+    /**
+     * An internal produce method that bypasses the network stack for efficiency.
+     * Used by the GroupCoordinator to commit offsets.
+     */
+    public void produceInternal(String topic, String key, byte[] payload) {
+        int partition = Math.abs(key.hashCode()) % partitionCount;
+        SafeRandomAccessFile safeFile = topicFiles(topic)[partition];
+
+        try {
+            long recordId = nextRecordId(topic, partition);
+            long timestamp = System.currentTimeMillis();
+            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+
+            Checksum crc = new CRC32();
+            crc.update(payload, 0, payload.length);
+            int crcValue = (int) crc.getValue();
+
+            int keyLen = keyBytes.length;
+            int payloadLen = payload.length;
+            int totalLen = 4 + 8 + 8 + 4 + keyLen + 4 + payloadLen;
+
+            safeFile.seek(safeFile.length());
+            safeFile.writeInt(totalLen);
+            safeFile.writeInt(crcValue);
+            safeFile.writeLong(recordId);
+            safeFile.writeLong(timestamp);
+            safeFile.writeInt(keyLen);
+            safeFile.write(keyBytes);
+            safeFile.writeInt(payloadLen);
+            safeFile.write(payload);
+
+            if (safeFile.length() >= maxSegmentSizeBytes) {
+                rollSegment(topic, partition, recordId + 1);
+            }
+        } catch (IOException e) {
+            System.err.println("FATAL: Error in internal produce: " + e.getMessage());
+            // This is a critical error, as it means the server can't manage its own state.
+        }
     }
 
     /* ---------------------------------------------------------- */
@@ -74,6 +126,32 @@ public class MiniKafkaWithSegmentsFixed {
     /* ---------------------------------------------------------- */
     public synchronized void addListener(String topic, PartitionListener l) {
         listeners.computeIfAbsent(topic, k -> new CopyOnWriteArrayList<>()).add(l);
+    }
+
+    private void rebuildSegmentsFromDisk() {
+        Path logsDir = base.resolve("logs");
+        if (!Files.exists(logsDir)) return;
+
+        try (DirectoryStream<Path> topics = Files.newDirectoryStream(logsDir)) {
+            for (Path topicDir : topics) {
+                if (!Files.isDirectory(topicDir)) continue;
+                String topic = topicDir.getFileName().toString();
+                try (DirectoryStream<Path> partitions = Files.newDirectoryStream(topicDir)) {
+                    for (Path partitionDir : partitions) {
+                        if (!Files.isDirectory(partitionDir)) continue;
+                        try {
+                            int partition = Integer.parseInt(partitionDir.getFileName().toString());
+                            getOrCreateSegments(topic, partition); // This will trigger the scan and population
+                        } catch (NumberFormatException e) {
+                            // Ignore directories that aren't partition numbers
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("Error rebuilding segments from disk: " + e.getMessage());
+            throw new RuntimeException(e);
+        }
     }
 
     /* ---------------------------------------------------------- */
@@ -210,59 +288,10 @@ private  long nextRecordId(String topic, int partition) {
         });
     }
 
-    @SuppressWarnings("unchecked")
-    private void loadOffsets() {
-        if (!Files.exists(offsetFile))
-            return;
-        try (Reader r = Files.newBufferedReader(offsetFile)) {
-            Map<String, Map<String, Double>> raw = new com.google.gson.Gson().fromJson(r, Map.class);
-            raw.forEach((tp, gm) -> gm.forEach((g, off) -> offsets.computeIfAbsent(tp, k -> new ConcurrentHashMap<>())
-                    .put(g, off.longValue())));
-        } catch (Exception e) {
-            System.err.println("offset load failed: " + e);
-        }
-    }
-
-    @SuppressWarnings("unchecked")
-    private void loadSegments() {
-        Path segmentsFile = base.resolve("segments.json");
-        if (!Files.exists(segmentsFile))
-            return;
-        try (Reader r = Files.newBufferedReader(segmentsFile)) {
-            Map<String, Map<String, List<Double>>> raw = new com.google.gson.Gson().fromJson(r, Map.class);
-            raw.forEach((topic, pm) -> {
-                Map<Integer, List<Long>> partitionMap = new ConcurrentHashMap<>();
-                pm.forEach((pStr, segments) -> {
-                    int partition = Integer.parseInt(pStr);
-                    List<Long> segmentOffsets = new ArrayList<>();
-                    segments.forEach(offset -> segmentOffsets.add(offset.longValue()));
-                    partitionMap.put(partition, segmentOffsets);
-                });
-                topicPartitionSegments.put(topic, partitionMap);
-            });
-        } catch (Exception e) {
-            System.err.println("segments load failed: " + e);
-        }
-    }
-
-    private void saveOffsets() {
-        try (Writer w = Files.newBufferedWriter(offsetFile)) {
-            new com.google.gson.Gson().toJson(offsets, w);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
-    private void saveSegments() {
-        try (Writer w = Files.newBufferedWriter(base.resolve("segments.json"))) {
-            new com.google.gson.Gson().toJson(topicPartitionSegments, w);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
     private void shutdown() {
         try {
+            groupCoordinator.shutdown(); // Shut down the coordinator
+
             server.close();
             topicFiles.values().forEach(fa -> {
                 for (SafeRandomAccessFile f : fa)
@@ -277,8 +306,7 @@ private  long nextRecordId(String topic, int partition) {
                 } catch (Exception ignore) {
                 }
             });
-            saveOffsets();
-            saveSegments();
+            // No longer need to save offsets or segments here
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -378,13 +406,19 @@ private  long nextRecordId(String topic, int partition) {
             crc.update(payload, 0, payload.length);
             int crcValue = (int) crc.getValue();
 
+            // New format: [total_len (int)] [crc (int)] [id (long)] [ts (long)] [key_len (int)] [key] [payload_len (int)] [payload]
+            int keyLen = keyBytes.length;
+            int payloadLen = payload.length;
+            int totalLen = 4 + 8 + 8 + 4 + keyLen + 4 + payloadLen; // crc, id, ts, key_len, key, payload_len, payload
+
             safeFile.seek(safeFile.length());
+            safeFile.writeInt(totalLen);
+            safeFile.writeInt(crcValue);
             safeFile.writeLong(recordId);
             safeFile.writeLong(timestamp);
-            safeFile.writeInt(crcValue); // CRC32
-            safeFile.writeInt(keyBytes.length);
+            safeFile.writeInt(keyLen);
             safeFile.write(keyBytes);
-            safeFile.writeInt(payload.length);
+            safeFile.writeInt(payloadLen);
             safeFile.write(payload);
 
             if (safeFile.length() >= maxSegmentSizeBytes) {
@@ -433,9 +467,8 @@ private  long nextRecordId(String topic, int partition) {
             int endPartition = (requestedPartition == -1) ? partitionCount - 1 : requestedPartition;
 
             for (int p = startPartition; p <= endPartition; p++) {
-                String tpKey = consumeTopic + ":" + p;
-                long nextRecord = offsets.computeIfAbsent(tpKey, k -> new ConcurrentHashMap<>())
-                        .getOrDefault(consumeGroup, 0L);
+                // Fetch offset from the GroupCoordinator
+                long nextRecord = groupCoordinator.getOffset(consumeGroup, consumeTopic, p);
 
                 List<Long> segments = getOrCreateSegments(consumeTopic, p);
 
@@ -453,11 +486,19 @@ private  long nextRecordId(String topic, int partition) {
                         long fileLength = f.length();
                         long pos = 0; // Start from the beginning of the segment
 
-                        while (pos + 8 <= fileLength) { // Check for at least a long
+                        while (pos + 4 <= fileLength) // Check for at least a length field
+                        {
                             f.seek(pos);
+                            int totalLen = f.readInt();
+
+                            if (pos + 4 + totalLen > fileLength) {
+                                // Incomplete record at the end of the file.
+                                break;
+                            }
+
+                            int crcValue = f.readInt();
                             long recordId = f.readLong();
                             long timestamp = f.readLong();
-                            int crcValue = f.readInt(); // Read CRC32
                             
                             int keyLen = f.readInt();
                             if (keyLen < 0 || keyLen > 1024) { // Sanity check for key length
@@ -473,15 +514,11 @@ private  long nextRecordId(String topic, int partition) {
                                 break;
                             }
                             
-                            long recordEndPos = pos + 8 + 8 + 4 + 4 + keyLen + 4 + len; // Adjusted for CRC
-                            if (recordEndPos > fileLength) {
-                                // Incomplete record at the end of the file.
-                                break;
-                            }
-
+                            // The record length check already ensures we have enough bytes
+                            
                             /* skip if not yet reached */
                             if (recordId < nextRecord) {
-                                pos = recordEndPos;
+                                pos += 4 + totalLen;
                                 continue;
                             }
 
@@ -493,13 +530,13 @@ private  long nextRecordId(String topic, int partition) {
                             crc.update(payloadBytes, 0, payloadBytes.length);
                             if ((int) crc.getValue() != crcValue) {
                                 System.err.println("CRC mismatch for record " + recordId + " in " + segmentFile + ". Skipping.");
-                                pos = recordEndPos;
+                                pos += 4 + totalLen;
                                 continue; // Skip corrupted record
                             }
 
                             /* respect toOffset */
                             if (consumeToOffset >= 0 && recordId > consumeToOffset) {
-                                pos = recordEndPos;
+                                pos += 4 + totalLen;
                                 continue;
                             }
 
@@ -544,9 +581,8 @@ private  long nextRecordId(String topic, int partition) {
                 write("-ERR no outstanding msg\n");
                 return;
             }
-            String tpKey = consumeTopic + ":" + consumePartition;
-            offsets.get(tpKey).put(consumeGroup, deliverOffset + 1); // advance by 1 record
-            saveOffsets();
+            // Commit offset via the GroupCoordinator
+            groupCoordinator.commitOffset(consumeGroup, consumeTopic, consumePartition, deliverOffset + 1);
             write("+OK\n");
             consumeTopic = null;
         }
@@ -575,7 +611,6 @@ private  long nextRecordId(String topic, int partition) {
                 return;
             }
             for (int p = 0; p < partitionCount; p++) {
-                String tpKey = topic + ":" + p;
                 long offset;
                 if ("BEGIN".equals(offsetSpec)) {
                     offset = 0;
@@ -587,9 +622,10 @@ private  long nextRecordId(String topic, int partition) {
                         return;
                     }
                 }
-                offsets.computeIfAbsent(tpKey, k -> new ConcurrentHashMap<>()).put(group, offset);
+                // Commit offset via the GroupCoordinator
+                groupCoordinator.commitOffset(group, topic, p, offset);
             }
-            saveOffsets();
+            // No longer need to save immediately, as it's handled by the coordinator
             write("+OK\n");
         }
     }
