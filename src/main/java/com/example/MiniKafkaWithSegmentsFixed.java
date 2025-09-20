@@ -345,69 +345,80 @@ private  long nextRecordId(String topic, int partition) {
         }
 
         /* ---------- PRODUCE ---------- */
-        private void handleProduce(String topicKeyPayload) throws IOException {
-            int k = topicKeyPayload.indexOf('<');
-            if (k < 0) {
-                write("-ERR bad format, expected TOPIC<key|payload>\n");
+        private void handleProduce(String line) throws IOException {
+            String[] parts = line.split(" ", 4);
+            if (parts.length < 4) {
+                write("-ERR bad format, expected TOPIC <topic> <key> <payload_length>\\n<payload>\n");
                 return;
             }
-            String topic = topicKeyPayload.substring(0, k);
-            String keyAndPay = topicKeyPayload.substring(k + 1, topicKeyPayload.length() - 1);
-            int sep = keyAndPay.indexOf('|');
-            String key = sep < 0 ? "" : keyAndPay.substring(0, sep);
-            byte[] payloadRaw = (sep < 0 ? keyAndPay : keyAndPay.substring(sep + 1)).getBytes(StandardCharsets.UTF_8);
+            String topic = parts[1];
+            String key = parts[2];
+            int payloadLength;
+            try {
+                payloadLength = Integer.parseInt(parts[3]);
+            } catch (NumberFormatException e) {
+                write("-ERR invalid payload length\n");
+                return;
+            }
+
+            byte[] payload = new byte[payloadLength];
+            in.readFully(payload);
 
             int partition = Math.abs(key.hashCode()) % partitionCount;
             SafeRandomAccessFile safeFile = topicFiles(topic)[partition];
 
-            byte[] data = payloadRaw; // no compression
-
-            /* NEW: record id instead of byte offset */
             long recordId = nextRecordId(topic, partition);
             safeFile.seek(safeFile.length());
-            safeFile.writeInt((int) recordId);   // 4
-            safeFile.writeInt(data.length);      // 4
-            safeFile.write(data);                // N
+            safeFile.writeInt((int) recordId);
+            safeFile.writeInt(payload.length);
+            safeFile.write(payload);
 
-            /* roll segment by byte size (optional) */
             if (safeFile.length() >= maxSegmentSizeBytes) {
                 rollSegment(topic, partition, recordId + 1);
             }
 
             write("+OFFSET " + recordId + '\n');
 
-            /* notify listeners */
             List<PartitionListener> list = listeners.get(topic);
             if (list != null) {
                 for (PartitionListener l : list)
-                    l.onMessage(partition, recordId, key, data);
+                    l.onMessage(partition, recordId, key, payload);
             }
         }
 
         /* ---------- CONSUME ---------- */
         private void handleConsume(String req) throws IOException {
             String[] parts = req.split(":");
-            if (parts.length < 2) {
-                write("-ERR bad format, expected TOPIC:GROUP[:toOffset]\n");
+            if (parts.length < 3) { // topic:group:partition
+                write("-ERR bad format, expected TOPIC:GROUP:PARTITION[:toOffset]\n");
                 return;
             }
             consumeTopic = parts[0];
+            consumeGroup = parts[1];
+            int requestedPartition;
+            try {
+                requestedPartition = Integer.parseInt(parts[2]);
+            } catch (NumberFormatException e) {
+                write("-ERR invalid partition number\n");
+                return;
+            }
 
-            /* --- parse group and optional toOffset --- */
-            if (parts.length == 2) {                 // old style:  TOPIC:GROUP
-                consumeGroup = parts[1];
-                consumeToOffset = -1;
-            } else {                                 // new style:  TOPIC:GROUP:toOffset
-                consumeGroup = parts[1];
+            /* --- parse optional toOffset --- */
+            if (parts.length > 3) {
                 try {
-                    consumeToOffset = Long.parseLong(parts[parts.length - 1]);
+                    consumeToOffset = Long.parseLong(parts[3]);
                 } catch (NumberFormatException e) {
                     write("-ERR invalid toOffset\n");
                     return;
                 }
+            } else {
+                consumeToOffset = -1;
             }
 
-            for (int p = 0; p < partitionCount; p++) {
+            int startPartition = (requestedPartition == -1) ? 0 : requestedPartition;
+            int endPartition = (requestedPartition == -1) ? partitionCount - 1 : requestedPartition;
+
+            for (int p = startPartition; p <= endPartition; p++) {
                 String tpKey = consumeTopic + ":" + p;
                 long nextRecord = offsets.computeIfAbsent(tpKey, k -> new ConcurrentHashMap<>())
                         .getOrDefault(consumeGroup, 0L);
@@ -431,13 +442,13 @@ private  long nextRecordId(String topic, int partition) {
                         while (pos + 8 <= fileLength) {
                             f.seek(pos);
                             int recordId = f.readInt();
-                            int len      = f.readInt();
+                            int len = f.readInt();
                             if (len < 0 || len > 100_000_000) {
                                 // Data corruption or not at a record boundary.
                                 // For this implementation, we'll stop reading this segment.
                                 break;
                             }
-                            if (pos + 8 + len > fileLength)   {
+                            if (pos + 8 + len > fileLength) {
                                 // Incomplete record at the end of the file.
                                 break;
                             }
@@ -459,10 +470,10 @@ private  long nextRecordId(String topic, int partition) {
 
                             /* deliver */
                             deliverOffset = recordId;
-                            deliverBuf    = payloadBytes;
+                            deliverBuf = payloadBytes;
                             consumePartition = p;
 
-                            write("+MSG " + recordId + ' ' + len + '\n');
+                            write("+MSG " + recordId + ' ' + len + ' ' + p + '\n');
                             out.write(payloadBytes);
                             out.write('\n');
                             out.flush();
@@ -470,15 +481,18 @@ private  long nextRecordId(String topic, int partition) {
                             found = true;
                             break;
                         }
-                        if (found) break;
+                        if (found)
+                            break;
 
                         /* early abort if next segment is already too far */
-                        if (consumeToOffset >= 0 && pos > consumeToOffset) break;
+                        if (consumeToOffset >= 0 && pos > consumeToOffset)
+                            break;
                     } catch (IOException e) {
                         // skip segment
                     }
                 }
-                if (found) return;
+                if (found)
+                    return;
             }
 
             /* nothing found */

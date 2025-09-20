@@ -36,9 +36,10 @@ public class MiniKafkaClientWithOffset implements AutoCloseable {
                 DataOutputStream out = new DataOutputStream(s.getOutputStream());
                 DataInputStream in = new DataInputStream(s.getInputStream())) {
 
-            String frame = "TOPIC" + topic + '<' + (key == null ? "" : key) + '|'
-                    + new String(payload, StandardCharsets.UTF_8) + ">\n";
-            out.writeBytes(frame);
+            // New binary-safe protocol: TOPIC <topic> <key> <payload_length>\n<payload_bytes>
+            String header = "TOPIC " + topic + " " + (key == null ? "" : key) + " " + payload.length + "\n";
+            out.writeBytes(header);
+            out.write(payload);
             out.flush();
 
             String resp = readLine(in);
@@ -54,10 +55,10 @@ public class MiniKafkaClientWithOffset implements AutoCloseable {
      * ----------------------------------------------------------
      */
     public void consume(String group, String topic, Handler handler) {
-        consume(group, topic, -1, -1, handler);
+        consume(group, topic, -1, -1, -1, handler);
     }
 
-    public void consume(String group, String topic, long fromOffset, long toOffset, Handler handler) {
+    public void consume(String group, String topic, long fromOffset, long toOffset, int partition, Handler handler) {
         listenerPool.submit(() -> {
             boolean offsetSet = false;
             while (!Thread.currentThread().isInterrupted()) {
@@ -84,25 +85,25 @@ public class MiniKafkaClientWithOffset implements AutoCloseable {
                         offsetSet = true;
                     }
 
-                    // If toOffset is specified, append it to the group parameter
-                    String consumeGroup = group;
+                    // New format: TOPIC:GROUP:PARTITION[:toOffset]
+                    String consumeRequest = topic + ":" + group + ":" + partition;
                     if (toOffset >= 0) {
-                        consumeGroup = group + ":" + toOffset;
+                        consumeRequest += ":" + toOffset;
                     }
-
-                    out.writeBytes(topic + ':' + consumeGroup + '\n');
+                    out.writeBytes(consumeRequest + '\n');
                     out.flush();
 
-               String resp = readLine(in);
-if (resp == null) break;
-if (resp.startsWith("+EMPTY") || resp.startsWith("+END ")) {
-    if (resp.startsWith("+END ")) {
-        System.out.println("Reached end offset " + resp.split(" ")[1] + ", stopping consumption");
-        break;               // leave loop – no error
-    }
-    Thread.sleep(200);
-    continue;
-}
+                    String resp = readLine(in);
+                    if (resp == null)
+                        break;
+                    if (resp.startsWith("+EMPTY") || resp.startsWith("+END ")) {
+                        if (resp.startsWith("+END ")) {
+                            System.out.println("Reached end offset " + resp.split(" ")[1] + ", stopping consumption");
+                            break; // leave loop – no error
+                        }
+                        Thread.sleep(200);
+                        continue;
+                    }
                     if (!resp.startsWith("+MSG ")) {
                         throw new IOException("Unexpected response: " + resp);
                     }
@@ -110,6 +111,7 @@ if (resp.startsWith("+EMPTY") || resp.startsWith("+END ")) {
                     String[] meta = resp.split(" ");
                     long offset = Long.parseLong(meta[1]);
                     int len = Integer.parseInt(meta[2]);
+                    int receivedPartition = Integer.parseInt(meta[3]);
 
                     if (toOffset >= 0 && offset > toOffset) {
                         System.out.println("Reached end offset " + toOffset + ", stopping consumption");
@@ -120,10 +122,7 @@ if (resp.startsWith("+EMPTY") || resp.startsWith("+END ")) {
                     in.readFully(payload);
                     in.read(); // consume trailing \n
 
-                    // ✅ SAFELY DISPLAY PAYLOAD
-                    String display = formatPayload(payload);
-                    int partition = guessPartition(topic, payload);
-                    handler.onMessage(partition, offset, "", payload);
+                    handler.onMessage(receivedPartition, offset, "", payload);
 
                     out.writeBytes("ACK\n");
                     out.flush();
@@ -143,10 +142,6 @@ if (resp.startsWith("+EMPTY") || resp.startsWith("+END ")) {
                 }
             }
         });
-    }
-
-    private int guessPartition(String topic, byte[] payload) {
-        return Math.abs(new String(payload).hashCode()) % 4;
     }
 
     private String readLine(DataInputStream in) throws IOException {
@@ -216,40 +211,47 @@ if (resp.startsWith("+EMPTY") || resp.startsWith("+END ")) {
     public static void main(String[] args) throws Exception {
         if (args.length < 3) {
             System.err.println(
-                    "Usage: java MiniKafkaClientWithOffset <host> <port> <topic> [group] [fromOffset] [toOffset]");
+                    "Usage: java MiniKafkaClientWithOffset <host> <port> <topic> [group] [partition] [fromOffset] [toOffset]");
             System.exit(1);
         }
 
         String host = args[0];
         int port = Integer.parseInt(args[1]);
         String topic = args[2];
-        String group = args.length > 3 ? args[3] : "g1";
-        long fromOffset = args.length > 4 ? Long.parseLong(args[4]) : -1;
-        long toOffset = args.length > 5 ? Long.parseLong(args[5]) : -1;
 
-        MiniKafkaClientWithOffset cli = new MiniKafkaClientWithOffset(host, port);
-
-        // Example producer
-        if (args.length == 3) {
-            long off = cli.produce(topic, "user123", "{\"event\":\"login\"}".getBytes(StandardCharsets.UTF_8));
-            System.out.println("Sent to offset " + off);
+        // Produce mode
+        if (args.length == 4 && "produce".equals(args[3])) {
+            try (MiniKafkaClientWithOffset cli = new MiniKafkaClientWithOffset(host, port)) {
+                for (int i = 0; i < 30; i++) {
+                    String key = "key" + i;
+                    String payload = "message " + i;
+                    long off = cli.produce(topic, key, payload.getBytes(StandardCharsets.UTF_8));
+                    System.out.println("Sent to offset " + off);
+                }
+            }
             return;
         }
 
-        // Consumer
-        cli.consume(group, topic, fromOffset, toOffset, (partition, offset, key, payload) -> {
-            String safeDisplay;
-            try {
-                safeDisplay = new String(payload, StandardCharsets.UTF_8);
-            } catch (Exception e) {
-                safeDisplay = "<binary (" + payload.length + " bytes)> " + bytesToHex(payload);
-            }
-            System.out
-                    .println("Received message at offset " + offset + " (partition " + partition + "): " + safeDisplay);
-        });
+        // Consume mode
+        String group = args.length > 3 ? args[3] : "g1";
+        int partition = args.length > 4 ? Integer.parseInt(args[4]) : -1; // -1 for all
+        long fromOffset = args.length > 5 ? Long.parseLong(args[5]) : -1;
+        long toOffset = args.length > 6 ? Long.parseLong(args[6]) : -1;
 
-        // Keep alive
-        Thread.sleep(Long.MAX_VALUE);
-        cli.close();
+        try (MiniKafkaClientWithOffset cli = new MiniKafkaClientWithOffset(host, port)) {
+            cli.consume(group, topic, fromOffset, toOffset, partition, (p, offset, key, payload) -> {
+                String safeDisplay;
+                try {
+                    safeDisplay = new String(payload, StandardCharsets.UTF_8);
+                } catch (Exception e) {
+                    safeDisplay = "<binary (" + payload.length + " bytes)> " + bytesToHex(payload);
+                }
+                System.out
+                        .println("Received message at offset " + offset + " (partition " + p + "): " + safeDisplay);
+            });
+
+            // Keep alive
+            Thread.sleep(Long.MAX_VALUE);
+        }
     }
 }

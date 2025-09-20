@@ -5,7 +5,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.Random;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -13,105 +15,87 @@ import java.util.concurrent.atomic.AtomicLong;
  * to test the listener functionality and performance.
  */
 public class MessageProducer {
-    private final MiniKafkaClient client;
-    private final String topic;
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-    private final Random random = new Random();
-    private volatile boolean running = true;
-    private final int messagesPerSecond;
-    private final AtomicLong totalMessagesSent = new AtomicLong(0);
-    private long lastReportTime = System.currentTimeMillis();
 
-    public MessageProducer(String host, int port, String topic, int messagesPerSecond) {
-        this.client = new MiniKafkaClient(host, port);
-        this.topic = topic;
-        this.messagesPerSecond = messagesPerSecond;
-    }
+    public void start(String topic, int messagesPerSecond, int durationSeconds) {
+        System.out.println("Starting producer for topic '" + topic + "'...");
+        
+        // The client is now stateless regarding connection, just holds config.
+        MiniKafkaClientWithOffset client = new MiniKafkaClientWithOffset("localhost", 9092);
 
-    public void start() {
-        System.out.println("Starting message producer for topic: " + topic + 
-                          ", sending " + messagesPerSecond + " messages per second");
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+        AtomicLong totalMessagesSent = new AtomicLong(0);
+        Random random = new Random();
 
-        // Send bulk messages every second
-        scheduler.scheduleAtFixedRate(() -> {
+        Runnable messageSender = () -> {
             try {
-                if (!running)
-                    return;
-
-                long startTime = System.currentTimeMillis();
                 int sentInBatch = 0;
-                
                 // Send multiple messages in this batch
                 for (int i = 0; i < messagesPerSecond; i++) {
-                    // Generate a random message
                     int messageId = random.nextInt(1000000);
                     String key = "key-" + messageId;
-                    String payload = "{\"id\":" + messageId + 
-                            ",\"timestamp\":" + System.currentTimeMillis() +
-                            ",\"batch\":\"batch-" + (totalMessagesSent.get() / messagesPerSecond) +
-                            ",\"data\":\"Test message " + messageId + " from batch " + (totalMessagesSent.get() / messagesPerSecond) + "\"}";
+
+                    // Generate a mixed binary/text payload
+                    String textPart = "{\"id\":" + messageId + ",\"ts\":" + System.currentTimeMillis() + "}";
+                    byte[] textBytes = textPart.getBytes(StandardCharsets.UTF_8);
+                    byte[] binaryPart = new byte[16]; // 16 random bytes
+                    random.nextBytes(binaryPart);
+
+                    // Combine into a single payload
+                    byte[] payload = new byte[textBytes.length + binaryPart.length];
+                    System.arraycopy(textBytes, 0, payload, 0, textBytes.length);
+                    System.arraycopy(binaryPart, 0, payload, textBytes.length, binaryPart.length);
 
                     // Send the message
-                    long offset = client.produce(topic, key, payload.getBytes(StandardCharsets.UTF_8));
+                    client.produce(topic, key, payload);
                     totalMessagesSent.incrementAndGet();
                     sentInBatch++;
                 }
-                
-                long batchTime = System.currentTimeMillis() - startTime;
-                
-                // Report statistics every 10 seconds
-                long currentTime = System.currentTimeMillis();
-                if (currentTime - lastReportTime >= 10000) {
-                    double secondsElapsed = (currentTime - lastReportTime) / 1000.0;
-                    double rate = totalMessagesSent.get() / secondsElapsed;
-                    System.out.printf("Sent %d messages in %.2f seconds (%.2f msgs/sec)%n", 
-                            totalMessagesSent.get(), secondsElapsed, rate);
-                    totalMessagesSent.set(0);
-                    lastReportTime = currentTime;
-                }
-                
-                if (batchTime > 1000) {
-                    System.out.println("Warning: Last batch took " + batchTime + "ms to send " + sentInBatch + " messages");
-                }
+                System.out.println("Sent " + sentInBatch + " messages in this batch. Total sent: " + totalMessagesSent.get());
             } catch (IOException e) {
-                System.err.println("Error producing messages: " + e.getMessage());
+                System.err.println("Failed to send message: " + e.getMessage());
+                // Optional: add a stack trace for debugging
+                // e.printStackTrace();
             }
-        }, 0, 1, TimeUnit.SECONDS);
-    }
+        };
 
-    public void stop() {
-        running = false;
-        scheduler.shutdown();
+        ScheduledFuture<?> future = scheduler.scheduleAtFixedRate(messageSender, 0, 1, TimeUnit.SECONDS);
+
         try {
-            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+            // Let the producer run for the specified duration
+            future.get(durationSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            // This is the normal way to stop after the duration
+            future.cancel(true);
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            scheduler.shutdown();
+            try {
+                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                    scheduler.shutdownNow();
+                }
+            } catch (InterruptedException e) {
                 scheduler.shutdownNow();
             }
-        } catch (InterruptedException e) {
-            scheduler.shutdownNow();
-            Thread.currentThread().interrupt();
+            
+            // Close the client's thread pool
+            client.close();
         }
-        client.close();
-        System.out.println("Message producer stopped");
+
+        System.out.println("Producer finished. Total messages sent: " + totalMessagesSent.get());
     }
 
-    public static void main(String[] args) throws Exception {
-        if (args.length < 3) {
-            System.err.println("Usage: java MessageProducer <host> <port> <topic> [messagesPerSecond]");
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Usage: java com.example.MessageProducer <topic> [messagesPerSecond] [durationSeconds]");
             System.exit(1);
         }
 
-        String host = args[0];
-        int port = Integer.parseInt(args[1]);
-        String topic = args[2];
-        int messagesPerSecond = args.length > 3 ? Integer.parseInt(args[3]) : 10;
+        String topic = args[0];
+        int messagesPerSecond = args.length > 1 ? Integer.parseInt(args[1]) : 10;
+        int durationSeconds = args.length > 2 ? Integer.parseInt(args[2]) : 10;
 
-        MessageProducer producer = new MessageProducer(host, port, topic, messagesPerSecond);
-        producer.start();
-
-        // Add shutdown hook to gracefully stop the producer
-        Runtime.getRuntime().addShutdownHook(new Thread(producer::stop));
-
-        // Keep running until interrupted
-        Thread.sleep(Long.MAX_VALUE);
+        MessageProducer producer = new MessageProducer();
+        producer.start(topic, messagesPerSecond, durationSeconds);
     }
 }
